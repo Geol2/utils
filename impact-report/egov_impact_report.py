@@ -2,7 +2,7 @@
 # 사용: python egov_impact_report.py ./src TB_USER --start 2026-09-14 --people 2
 #   pip install openpyxl
 # 검색어: 테이블명 / mapper id / 컨트롤러 URL / JS 함수명(fn_xxx) 아무거나
-import re, sys, argparse, pathlib, datetime as dt
+import re, sys, time, argparse, pathlib, datetime as dt
 from collections import defaultdict
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -32,46 +32,70 @@ a = ap.parse_args()
 root, q = pathlib.Path(a.root), a.query.lower()
 read = lambda p: p.read_text(encoding='utf-8', errors='ignore')
 
-# ---------- 1. 인덱스 구축 ----------
-url_to_method, id_to_tables, id_to_xml = {}, {}, {}
-java_calls_id = defaultdict(set)     # java stem -> mapper ids
-view_calls_url = defaultdict(set)    # url -> jsp/js files
-view_calls_fn  = defaultdict(set)    # fn_xxx -> jsp/js files
-lines = {}
+# ---------- 진행 표시 ----------
+try: sys.stdout.reconfigure(errors='replace')   # cp949 콘솔에서 ✔ 같은 기호 때문에 죽지 않게
+except Exception: pass
+_t0 = time.time(); _last = [0.0]; _cr = [False]
+def _line(s):
+    if _cr[0]: print(); _cr[0] = False
+    print(s, flush=True)
+def stage(s): _line(f'▶ {s}')
+def done(s): _line(f'   ✔ {s}')
+def tick(i, n, name):
+    now = time.time()
+    if i == n or now - _last[0] > 0.2:
+        _last[0] = now; print('\r' + f'   {i}/{n}  {name}'[:110].ljust(110), end='', flush=True); _cr[0] = True
 
-for j in root.rglob('*Controller.java'):
-    t = read(j); lines[j] = t.count('\n')
-    prefix = (re.search(r'@RequestMapping\(\s*"([^"]+)"', t) or [None, ''])[1]
-    for url, name in re.findall(
-        r'@(?:Request|Get|Post)Mapping\(\s*(?:value\s*=\s*)?"([^"]+)"[^)]*\)\s*(?:public\s+)?[\w<>\[\], ]+\s+(\w+)\s*\(', t):
-        url_to_method[prefix + url] = (j, name)
+# ---------- 정규식 ----------
+# 컨트롤러 메서드 매핑: @XxxMapping("url") [다른 어노테이션들] [제어자] 반환형 메서드명(
+MAP_RE = re.compile(r'@(?:Request|Get|Post|Put|Delete)Mapping\(\s*(?:(?:value|path)\s*=\s*)?\{?\s*"([^"]+)"[^)]*\)\s*'
+                    r'(?:@\w+(?:\([^)]*\))?\s*)*(?:(?:public|protected|private|static|final|synchronized)\s+)*[\w<>\[\], ?]+\s+(\w+)\s*\(')
+CLASS_MAP_RE = re.compile(r'@RequestMapping\(\s*(?:(?:value|path)\s*=\s*)?\{?\s*"([^"]+)"')
+# JS 함수 정의: function a(  /  a = function(  /  a: function(  /  a = (…) =>
+FN_DEF_RE = re.compile(r'function\s+(\w+)\s*\(|\b(\w+)\s*=\s*(?:async\s+)?function\s*\(|\b(\w+)\s*:\s*(?:async\s+)?function\s*\(|\b(\w+)\s*=\s*(?:async\s*)?\([^()]*\)\s*=>')
+FN_CALL_RE = re.compile(r'\b(\w+)\s*\(')
+FN_SKIP = {'function', 'if', 'for', 'while', 'switch', 'catch', 'return', 'typeof'}
+URL_LIT_RE = re.compile(r'["\']([^"\'\s<>]*/[^"\'\s<>]*)["\']')          # 슬래시가 든 문자열 리터럴 = URL 후보 ($.ajax url, form action, location.href, fetch 등 전부)
+SCRIPT_SRC_RE = re.compile(r'<script[^>]+src\s*=\s*["\'][^>]*?([\w.-]+\.js)\b', re.I)   # src="<c:url value='/js/a.js'/>" 처럼 감싸도 파일명만 뽑음
+JAVA_SUFFIX_RE = re.compile(r'(DAO|Dao|ServiceImpl|Service|Mapper)$')
 
-for x in root.rglob('*.xml'):
-    t = read(x)
-    for _, sid, body in re.findall(r'<(select|insert|update|delete)\s+id="([^"]+)"(.*?)</\1>', t, re.S):
-        id_to_tables[sid] = {m.upper() for m in re.findall(
-            r'\b(?:FROM|JOIN|INTO|UPDATE)\s+([A-Za-z_][\w.]*)', body, re.I)}
-        id_to_xml[sid] = x
+def norm_url(u):
+    u = re.sub(r'\$\{[^}]*\}|<%=[^%]*%>', '', u)          # ${ctx}, <%=ctx%> 제거
+    return u.split('?')[0].split('#')[0]
 
-for j in root.rglob('*.java'):
-    t = read(j); lines[j] = t.count('\n')
-    for sid in id_to_tables:
-        if re.search(rf'["\.]{re.escape(sid)}\s*["(]', t):
-            java_calls_id[j].add(sid)
+def url_matcher(url):
+    """컨트롤러 URL이 뷰 문자열 리터럴의 끝부분과 일치하는지. 컨텍스트 경로 prefix(/dWorks/user/list.do)와 {id} 같은 path variable 허용"""
+    if not url.startswith('/'): url = '/' + url
+    if '{' in url:
+        pat = re.compile(re.sub(r'\\\{[^}]*\\\}', r'[^/]+', re.escape(url)) + r'$')
+        return lambda lit: bool(pat.search(lit))
+    return lambda lit: lit == url or lit.endswith(url)
 
-for f in list(root.rglob('*.jsp')) + list(root.rglob('*.js')):
-    t = read(f); lines[f] = t.count('\n')
-    for u in re.findall(r'(?:url\s*:\s*|action\s*=\s*|\.(?:post|get)\(\s*)["\']([^"\']+\.do)', t):
-        view_calls_url[re.sub(r'^\$\{[^}]+\}', '', u)].add(f)
-    for fn in re.findall(r'\b(fn_\w+)\s*\(', t):
-        view_calls_fn[fn].add(f)
+def fn_spans(t):
+    """JS/JSP 안의 함수 정의 → [(함수명, 시작, 끝)] (중괄호 짝으로 본문 범위 계산)"""
+    stack, close = [], {}
+    for i, ch in enumerate(t):
+        if ch == '{': stack.append(i)
+        elif ch == '}' and stack: close[stack.pop()] = i
+    spans = []
+    for m in FN_DEF_RE.finditer(t):
+        fn = next(x for x in m.groups() if x)
+        if len(fn) < 3 or fn in FN_SKIP: continue
+        p = m.end()
+        if m.group(4) is None:                       # 화살표 함수가 아니면 파라미터 목록 건너뜀
+            p = t.find(')', p)
+            if p < 0: continue
+            p += 1
+        while p < len(t) and t[p] in ' \t\r\n': p += 1
+        if p < len(t) and t[p] == '{' and p in close: spans.append((fn, m.start(), close[p]))
+        else: spans.append((fn, m.start(), t.find('\n', p) if t.find('\n', p) > 0 else len(t)))   # 한 줄짜리 화살표 함수
+    return spans
 
-# ---------- 2. 영향 항목 수집 ----------
-items = {}  # (kind, path, name) -> {'impact': 직접|간접, 'via': str}
-def add(kind, path, name, impact, via=''):
-    k = (kind, str(path), name)
-    if k not in items or impact == '직접':
-        items[k] = {'impact': impact, 'via': via}
+def enclosing(spans, pos):
+    best = None
+    for fn, s, e in spans:
+        if s <= pos <= e and (best is None or e - s < best[2] - best[1]): best = (fn, s, e)
+    return best[0] if best else None
 
 def kind_of(p):
     s = p.name
@@ -82,32 +106,170 @@ def kind_of(p):
     if s.endswith('.js'): return 'JS'
     return 'Etc'
 
-# 테이블 / mapper id 기준
+# ---------- 1. 인덱스 구축 / 2. 영향 항목 수집 ----------
+if not root.is_dir(): sys.exit(f'폴더를 찾을 수 없습니다: {root}')
+
+stage('파일 목록 수집')
+java = list(root.rglob('*.java')); ctrls = [j for j in java if j.name.endswith('Controller.java')]
+xmls = list(root.rglob('*.xml')); views = list(root.rglob('*.jsp')) + list(root.rglob('*.js'))
+done(f'Java {len(java)}개 (Controller {len(ctrls)}) · XML {len(xmls)}개 · JSP/JS {len(views)}개')
+
+url_to_method, id_to_tables, id_to_xml, lines = {}, {}, {}, {}
+java_calls_id = defaultdict(set)      # java 파일 -> mapper ids
+view_calls_url = defaultdict(set)     # url -> {(파일, 함수명|None)}
+fn_urls = defaultdict(set)            # (파일, 함수명) -> urls
+fn_defs = defaultdict(set)            # 함수명 -> 정의한 파일
+fn_callers = defaultdict(set)         # 함수명 -> {(호출 파일, 호출한 함수명|None)} (정의 파일 제외)
+js_included_by = defaultdict(set)     # js 파일명 -> <script src> 로 include 한 jsp
+
+stage('Controller URL 매핑')
+for i, j in enumerate(ctrls, 1):
+    tick(i, len(ctrls), j.name); t = read(j)
+    m = re.search(r'\bclass\s+\w+', t)                      # 클래스 선언 앞에 있는 @RequestMapping 만 클래스 레벨 prefix
+    prefix = CLASS_MAP_RE.search(t[:m.start()]) if m else None
+    prefix = prefix.group(1) if prefix else ''
+    for url, name in MAP_RE.findall(t): url_to_method[(prefix + url).replace('//', '/')] = (j, name)
+done(f'URL {len(url_to_method)}개')
+
+stage('Mapper XML 파싱')
+for i, x in enumerate(xmls, 1):
+    tick(i, len(xmls), x.name); t = read(x)
+    for _, sid, body in re.findall(r'<(select|insert|update|delete)\s+id="([^"]+)"(.*?)</\1>', t, re.S):
+        id_to_tables[sid] = {m.upper() for m in re.findall(r'\b(?:FROM|JOIN|INTO|UPDATE)\s+([A-Za-z_][\w.]*)', body, re.I)}
+        id_to_xml[sid] = x
+done(f'statement {len(id_to_tables)}개 · 테이블 {len(set().union(*id_to_tables.values()))}개')
+
+stage('Java → Mapper 호출 추적')
+sid_re = re.compile(r'["\.](' + '|'.join(sorted(map(re.escape, id_to_tables), key=len, reverse=True)) + r')\s*["(]') if id_to_tables else None
+for i, j in enumerate(java, 1):
+    tick(i, len(java), j.name); t = read(j); lines[j] = t.count('\n')
+    if sid_re: java_calls_id[j].update(sid_re.findall(t))
+done(f'mapper 를 호출하는 Java {sum(1 for v in java_calls_id.values() if v)}개')
+
+stage('JSP/JS 스캔 (URL 호출 · 함수 정의 · script include)')
+url_pats = []
+for u in url_to_method:
+    seg = u.rsplit('/', 1)[-1]
+    url_pats.append((u, '' if '{' in seg else seg, url_matcher(u)))   # seg: 빠른 사전 필터용 (마지막 경로 조각)
+view_text, view_spans = {}, {}
+for i, f in enumerate(views, 1):
+    tick(i, len(views), f.name); t = read(f); view_text[f] = t; lines[f] = t.count('\n')
+    spans = fn_spans(t); view_spans[f] = spans
+    for fn, _, _ in spans: fn_defs[fn].add(f)
+    lits = [(norm_url(m.group(1)), m.start(1)) for m in URL_LIT_RE.finditer(t)]
+    for u, seg, match in url_pats:
+        if seg not in t: continue
+        for lit, pos in lits:
+            if match(lit):
+                fn = enclosing(spans, pos)
+                view_calls_url[u].add((f, fn)); fn_urls[(f, fn)].add(u)
+    if f.suffix.lower() == '.jsp':
+        for src in SCRIPT_SRC_RE.findall(t): js_included_by[src].add(f)
+for f, t in view_text.items():
+    for m in FN_CALL_RE.finditer(t):
+        fn = m.group(1)
+        if fn in fn_defs and f not in fn_defs[fn]: fn_callers[fn].add((f, enclosing(view_spans[f], m.start())))
+done(f'URL 호출 {sum(len(v) for v in view_calls_url.values())}건 · 함수 정의 {len(fn_defs)}개 · script include {sum(len(v) for v in js_included_by.values())}건')
+
+stage('영향 항목 수집')
+items, nodes, edges = {}, {}, set()
+def add(kind, path, name, impact, via=''):
+    k = (kind, str(path), name)
+    if k not in items or impact == '직접': items[k] = {'impact': impact, 'via': via}
+def node(kind, key, impact, label=None, title=''):
+    nid = f'{kind}|{key}'; n = nodes.get(nid)
+    if n is None: nodes[nid] = {'id': nid, 'kind': kind, 'label': label or key, 'impact': impact, 'title': title}
+    elif impact == '직접': n['impact'] = '직접'
+    return nid
+def link(a, b, rel=''): edges.add((a, b, rel))
+def vnode(f, fn, impact):
+    return node(kind_of(f), f'{f.name}::{fn}' if fn else f.name, impact, f'{f.name} › {fn}()' if fn else f.name, str(f))
+def cnode(cj, m, url, impact):
+    return node('Controller', f'{cj.stem}.{m} ({url})', impact, f'{cj.stem}.{m}', f'{url}\n{cj}')
+
+def hit_view(f, fn, impact, url, cn):
+    """뷰(JSP/JS)가 컨트롤러 URL 을 부름 → 항목 추가 + 그 함수를 호출하는 곳까지 한 단계 더"""
+    add(kind_of(f), f, f.name, impact, f'{url} ← {fn}()' if fn else url)
+    vn = vnode(f, fn, impact); link(vn, cn)
+    if fn:
+        for cf, cfn in fn_callers.get(fn, []):
+            add(kind_of(cf), cf, cf.name, '간접', f'{fn}() 호출'); link(vnode(cf, cfn, '간접'), vn)
+def hit_ctrl(cj, m, url, impact, via=''):
+    add('Controller', cj, f'{cj.stem}.{m} ({url})', impact, via)
+    cn = cnode(cj, m, url, impact)
+    for v, fn in view_calls_url.get(url, []): hit_view(v, fn, impact, url, cn)
+    return cn
+traced = set()
+def trace_down(cn, cj):
+    """컨트롤러 → (클래스명 관례로) Service/DAO → 그 클래스가 쓰는 mapper → 테이블. 클래스 단위 근사라 전부 간접"""
+    if cn in traced: return
+    traced.add(cn); cls = re.sub(r'Controller$', '', cj.stem)
+    g = {'Service': [], 'DAO': []}
+    for j, ids in java_calls_id.items():
+        if ids and JAVA_SUFFIX_RE.sub('', j.stem) == cls:
+            add(kind_of(j), j, j.stem, '간접', cj.stem)
+            jn = node(kind_of(j), j.stem, '간접', title=str(j)); g['DAO' if kind_of(j) == 'DAO' else 'Service'].append(jn)
+            for sid in ids:
+                add('Mapper', id_to_xml[sid], sid, '간접', j.stem)
+                mn = node('Mapper', sid, '간접', title=str(id_to_xml[sid])); link(jn, mn)
+                for t in id_to_tables[sid]: add('Table', '-', t, '간접', sid); link(mn, node('Table', t, '간접'))
+    for s in g['Service']:
+        for d in g['DAO']: link(s, d)
+    for x in (g['Service'] or g['DAO']): link(cn, x)
+
+# 테이블 / mapper id 기준: 아래에서 위로
 for sid, tables in id_to_tables.items():
     hit_tbl = [t for t in tables if q in t.lower()]
     if hit_tbl or q in sid.lower():
-        for t in hit_tbl: add('Table', '-', t, '직접')
-        add('Mapper', id_to_xml[sid], sid, '직접' if hit_tbl else '직접', ','.join(hit_tbl))
+        mn = node('Mapper', sid, '직접', title=str(id_to_xml[sid]))
+        for t in hit_tbl: add('Table', '-', t, '직접'); link(mn, node('Table', t, '직접'))
+        add('Mapper', id_to_xml[sid], sid, '직접', ','.join(hit_tbl))
+        by_cls = defaultdict(lambda: {'Service': [], 'DAO': [], 'stems': []})
         for j, ids in java_calls_id.items():
             if sid in ids:
                 add(kind_of(j), j, j.stem, '직접', sid)
-                cls = re.sub(r'(DAO|Dao|ServiceImpl|Service|Mapper)$', '', j.stem)
-                for url, (cj, m) in url_to_method.items():
-                    if cls and cls in cj.stem:
-                        add('Controller', cj, f'{cj.stem}.{m} ({url})', '간접', j.stem)
-                        for v in view_calls_url.get(url, []):
-                            add(kind_of(v), v, v.name, '간접', url)
-
-# URL 기준
+                jn = node(kind_of(j), j.stem, '직접', title=str(j)); link(jn, mn)
+                cls = JAVA_SUFFIX_RE.sub('', j.stem)
+                if cls: g = by_cls[cls]; g['DAO' if kind_of(j) == 'DAO' else 'Service'].append(jn); g['stems'].append(j.stem)
+        for cls, g in by_cls.items():
+            for s in g['Service']:
+                for d in g['DAO']: link(s, d)
+            for url, (cj, m) in url_to_method.items():
+                if cls in cj.stem:
+                    cn = hit_ctrl(cj, m, url, '간접', ', '.join(g['stems']))
+                    for x in (g['Service'] or g['DAO']): link(cn, x)
+done(f'테이블/Mapper 기준 {len(items)}건'); n = len(items)
+# URL 기준: 컨트롤러에서 양쪽으로
 for url, (cj, m) in url_to_method.items():
-    if q in url.lower() or q in m.lower():
-        add('Controller', cj, f'{cj.stem}.{m} ({url})', '직접')
-        for v in view_calls_url.get(url, []): add(kind_of(v), v, v.name, '직접', url)
+    if q in url.lower() or q in m.lower(): trace_down(hit_ctrl(cj, m, url, '직접'), cj)
+done(f'URL 기준 +{len(items) - n}건'); n = len(items)
+# JS 함수 기준 (식별자 형태 검색어일 때만): 정의한 파일 직접, 호출한 파일 간접, 그 함수가 부르는 컨트롤러부터 아래로
+if re.fullmatch(r'\w+', a.query):
+    for fn, files in fn_defs.items():
+        if q in fn.lower():
+            for v in files:
+                add(kind_of(v), v, f'{v.name}::{fn}', '직접', f'{fn} 정의'); vn = vnode(v, fn, '직접')
+                for url in fn_urls.get((v, fn), []):
+                    cj, m = url_to_method[url]
+                    add('Controller', cj, f'{cj.stem}.{m} ({url})', '간접', f'{fn}()'); cn = cnode(cj, m, url, '간접')
+                    link(vn, cn); trace_down(cn, cj)
+                for cf, cfn in fn_callers.get(fn, []):
+                    add(kind_of(cf), cf, cf.name, '간접', f'{fn}() 호출'); link(vnode(cf, cfn, '간접'), vn)
+done(f'JS 함수 기준 +{len(items) - n}건'); n = len(items)
+# 영향받은 JS 를 <script src> 로 물고 있는 JSP
+for jn in [x for x in nodes.values() if x['kind'] == 'JS']:
+    for jsp in js_included_by.get(jn['id'].split('|', 1)[1].split('::')[0], []):
+        add('JSP', jsp, jsp.name, '간접', f'{jn["label"].split(" ›")[0]} include'); link(vnode(jsp, None, '간접'), jn['id'], 'include')
+done(f'JS 를 include 하는 JSP +{len(items) - n}건')
 
-# JS 함수 기준
-for fn, files in view_calls_fn.items():
-    if q in fn.lower():
-        for v in files: add(kind_of(v), v, f'{v.name}::{fn}', '직접', fn)
+# 관계 정리: 같은 쌍에 호출/include 가 둘 다 있으면 호출만, 중간 노드를 거쳐 갈 수 있는 지름길 간선은 제거
+pairs = {(x, y) for x, y, _ in edges}
+edges = {(x, y, r) for x, y, r in edges if not (r and (x, y, '') in edges)}
+out = defaultdict(set)
+for x, y in pairs: out[x].add(y)
+edges = {(x, y, r) for x, y, r in edges if r or not any(y in out[m] for m in out[x] if m != y)}
+
+stage('공수·일정 산정')
 
 # ---------- 3. 공수/일정 ----------
 def md_of(kind, path, impact):
@@ -177,6 +339,12 @@ sheet(ws2, ['No', '구분', '항목', '파일', '영향', '경유', '공수(MD)'
       [5, 11, 40, 55, 7, 22, 9, 11, 11, 10, 30, 20])
 ws2.auto_filter.ref = ws2.dimensions
 
+lab = nodes
+ws4 = wb.create_sheet('연결관계')
+sheet(ws4, ['From 구분', 'From', 'To 구분', 'To', '관계'],
+      [[lab[x]['kind'], lab[x]['label'], lab[y]['kind'], lab[y]['label'], 'include' if r else '참조' if lab[y]['kind'] == 'Table' else '호출'] for x, y, r in sorted(edges)], [11, 40, 11, 40, 9])
+ws4.auto_filter.ref = ws4.dimensions
+
 ws3 = wb.create_sheet('공수기준')
 sheet(ws3, ['구분', '기본 MD/항목', '비고'],
       [[k, v, ''] for k, v in BASE_MD.items()] +
@@ -185,4 +353,4 @@ sheet(ws3, ['구분', '기본 MD/항목', '비고'],
       [16, 16, 30])
 
 wb.save(a.out)
-print(f'{a.out} 저장 — 영향 {len(rows)}건, 총 {total} MD, {start}~{end} ({int(days)} 영업일 / {a.people}명)')
+done(f'{a.out} 저장 — 영향 {len(rows)}건, 관계 {len(edges)}개, 총 {total} MD, {start}~{end} ({int(days)} 영업일 / {a.people}명), {time.time() - _t0:.1f}초')

@@ -1,0 +1,34 @@
+[
+ {
+  "root": "D:\\05_project\\eGovFrameDev-5.0.2-Windows-64bit\\workspace-egov\\dworks5.0",
+  "query": "/dockind/getWorkspaceDocKindListByPage.do",
+  "people": 1.0,
+  "count": 57,
+  "total": 33.38,
+  "at": "09-15 18:00"
+ },
+ {
+  "root": "C:\\Users\\big94\\AppData\\Local\\Temp\\claude\\D--05-project-1008-utils\\ff24e036-e809-4b52-861f-f11d88caddb2\\scratchpad\\sample",
+  "query": "TB_USER",
+  "people": 1.0,
+  "count": 11,
+  "total": 5.83,
+  "at": "09-15 17:58"
+ },
+ {
+  "root": "D:\\05_project\\eGovFrameDev-5.0.2-Windows-64bit\\workspace-egov\\dworks5.0",
+  "query": "selectExpiredFileDelete",
+  "people": 1.0,
+  "count": 4,
+  "total": 2.69,
+  "at": "09-15 17:58"
+ },
+ {
+  "root": "D:\\05_project\\eGovFrameDev-5.0.2-Windows-64bit\\workspace-egov\\dworks5.0",
+  "query": "deleteFileList",
+  "people": 1.0,
+  "count": 1,
+  "total": 0.75,
+  "at": "09-15 17:26"
+ }
+]
