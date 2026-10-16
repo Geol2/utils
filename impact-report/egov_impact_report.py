@@ -52,7 +52,7 @@ MAP_RE = re.compile(r'@(?:Request|Get|Post|Put|Delete)Mapping\(\s*(?:(?:value|pa
                     r'(?:@\w+(?:\([^)]*\))?\s*)*(?:(?:public|protected|private|static|final|synchronized)\s+)*[\w<>\[\], ?]+\s+(\w+)\s*\(')
 CLASS_MAP_RE = re.compile(r'@RequestMapping\(\s*(?:(?:value|path)\s*=\s*)?\{?\s*"([^"]+)"')
 # JS 함수 정의: function a(  /  a = function(  /  a: function(  /  a = (…) =>
-FN_DEF_RE = re.compile(r'function\s+(\w+)\s*\(|\b(\w+)\s*=\s*(?:async\s+)?function\s*\(|\b(\w+)\s*:\s*(?:async\s+)?function\s*\(|\b(\w+)\s*=\s*(?:async\s*)?\([^()]*\)\s*=>')
+FN_DEF_RE = re.compile(r'function\s+(\w+)\s*\(|\b(\w+)\s*=\s*(?:async\s+)?function\s*\(|\b(\w+)\s*:\s*(?:async\s+)?function\s*\(|\b(\w+)\s*=\s*(?:async\s*)?\(([^()]*)\)\s*=>')
 FN_CALL_RE = re.compile(r'\b(\w+)\s*\(')
 FN_SKIP = {'function', 'if', 'for', 'while', 'switch', 'catch', 'return', 'typeof'}
 URL_LIT_RE = re.compile(r'["\']([^"\'\s<>]*/[^"\'\s<>]*)["\']')          # 슬래시가 든 문자열 리터럴 = URL 후보 ($.ajax url, form action, location.href, fetch 등 전부)
@@ -72,7 +72,8 @@ def url_matcher(url):
     return lambda lit: lit == url or lit.endswith(url)
 
 def fn_spans(t):
-    """JS/JSP 안의 함수 정의 → [(함수명, 시작, 끝)] (중괄호 짝으로 본문 범위 계산)"""
+    """JS/JSP 안의 함수 정의 → [((함수명, 인자수), 인자목록, 시작, 끝)] (중괄호 짝으로 본문 범위 계산).
+    같은 이름이라도 인자 수가 다르면 다른 함수로 취급 (fnRestoreApply(a, b) vs fnRestoreApply(a, b, c, d))"""
     stack, close = [], {}
     for i, ch in enumerate(t):
         if ch == '{': stack.append(i)
@@ -82,19 +83,41 @@ def fn_spans(t):
         fn = next(x for x in m.groups() if x)
         if len(fn) < 3 or fn in FN_SKIP: continue
         p = m.end()
-        if m.group(4) is None:                       # 화살표 함수가 아니면 파라미터 목록 건너뜀
-            p = t.find(')', p)
-            if p < 0: continue
-            p += 1
+        if m.group(4) is None:                       # 화살표 함수가 아니면 '(' 다음부터 ')' 까지가 파라미터
+            e = t.find(')', p)
+            if e < 0: continue
+            params, p = t[p:e], e + 1
+        else: params = m.group(5)
+        params = [x.split('=')[0].strip() for x in params.split(',') if x.strip()]
+        key, sig = (fn, len(params)), ', '.join(params)
         while p < len(t) and t[p] in ' \t\r\n': p += 1
-        if p < len(t) and t[p] == '{' and p in close: spans.append((fn, m.start(), close[p]))
-        else: spans.append((fn, m.start(), t.find('\n', p) if t.find('\n', p) > 0 else len(t)))   # 한 줄짜리 화살표 함수
+        if p < len(t) and t[p] == '{' and p in close: spans.append((key, sig, m.start(), close[p]))
+        else: spans.append((key, sig, m.start(), t.find('\n', p) if t.find('\n', p) > 0 else len(t)))   # 한 줄짜리 화살표 함수
     return spans
 
+def count_args(t, p):
+    """t[p] 가 '(' 바로 다음 위치일 때 호출 인자 개수 (괄호 깊이 0 의 콤마 수). 문자열 안의 콤마/괄호는 무시"""
+    depth, n, seen, q, i = 0, 0, False, None, p
+    while i < len(t) and i - p < 3000:
+        ch = t[i]
+        if q:
+            if ch == '\\': i += 1
+            elif ch == q: q = None
+        elif ch in '"\'`': q = ch; seen = True
+        elif ch in '([{': depth += 1; seen = True
+        elif ch in ')]}':
+            if depth == 0: return n + 1 if seen else 0
+            depth -= 1
+        elif ch == ',' and depth == 0: n += 1
+        elif not ch.isspace(): seen = True
+        i += 1
+    return n + 1 if seen else 0
+
 def enclosing(spans, pos):
+    """pos 를 감싸는 가장 안쪽 함수의 (함수명, 인자수). 함수 밖이면 None"""
     best = None
-    for fn, s, e in spans:
-        if s <= pos <= e and (best is None or e - s < best[2] - best[1]): best = (fn, s, e)
+    for key, _, s, e in spans:
+        if s <= pos <= e and (best is None or e - s < best[2] - best[1]): best = (key, s, e)
     return best[0] if best else None
 
 def kind_of(p):
@@ -117,9 +140,11 @@ done(f'Java {len(java)}개 (Controller {len(ctrls)}) · XML {len(xmls)}개 · JS
 url_to_method, id_to_tables, id_to_xml, lines = {}, {}, {}, {}
 java_calls_id = defaultdict(set)      # java 파일 -> mapper ids
 view_calls_url = defaultdict(set)     # url -> {(파일, 함수명|None)}
-fn_urls = defaultdict(set)            # (파일, 함수명) -> urls
-fn_defs = defaultdict(set)            # 함수명 -> 정의한 파일
-fn_callers = defaultdict(set)         # 함수명 -> {(호출 파일, 호출한 함수명|None)} (정의 파일 제외)
+fn_urls = defaultdict(set)            # (파일, 함수키) -> urls          함수키 = (함수명, 인자수)
+fn_defs = defaultdict(set)            # 함수키 -> 정의한 파일
+fn_sig = {}                           # 함수키 -> 'fnName(a, b)' 표시용
+defs_by_name = defaultdict(set)       # 함수명 -> 함수키들 (인자 수가 다른 정의들)
+fn_callers = defaultdict(set)         # 함수키 -> {(호출 파일, 호출한 함수키|None)} (정의 파일 제외)
 js_included_by = defaultdict(set)     # js 파일명 -> <script src> 로 include 한 jsp
 
 stage('Controller URL 매핑')
@@ -132,12 +157,39 @@ for i, j in enumerate(ctrls, 1):
 done(f'URL {len(url_to_method)}개')
 
 stage('Mapper XML 파싱')
+# id 속성이 몇 번째에 오든(<select parameterType=".." id="..">) 잡히게 속성부를 통째로 캡처. <sql> 조각도 같이 수집
+STMT_RE    = re.compile(r'<(select|insert|update|delete|sql)\s+([^>]*?)>(.*?)</\1>', re.S)
+ID_ATTR_RE = re.compile(r'\bid="([^"]+)"')
+INCLUDE_RE = re.compile(r'<include\s+refid="([^"]+)"\s*(?:/>|>.*?</include>)', re.S)
+TABLE_RE   = re.compile(r'\b(?:FROM|JOIN|INTO|UPDATE)\s+([A-Za-z_][\w.]*)', re.I)
+
+frag_body, frag_xml, id_frags, raw_stmts = {}, {}, {}, []   # <sql id="..."> 조각 / statement -> 그 안에서 쓴 조각들
 for i, x in enumerate(xmls, 1):
     tick(i, len(xmls), x.name); t = read(x)
-    for _, sid, body in re.findall(r'<(select|insert|update|delete)\s+id="([^"]+)"(.*?)</\1>', t, re.S):
-        id_to_tables[sid] = {m.upper() for m in re.findall(r'\b(?:FROM|JOIN|INTO|UPDATE)\s+([A-Za-z_][\w.]*)', body, re.I)}
-        id_to_xml[sid] = x
-done(f'statement {len(id_to_tables)}개 · 테이블 {len(set().union(*id_to_tables.values()))}개')
+    for tag, attrs, body in STMT_RE.findall(t):
+        m = ID_ATTR_RE.search(attrs)
+        if not m: continue
+        if tag == 'sql': frag_body[m.group(1)] = body; frag_xml[m.group(1)] = x
+        else: raw_stmts.append((m.group(1), x, body))
+
+def expand_sql(body, depth=0):
+    """<include refid="X"/> 를 <sql id="X"> 본문으로 치환 -> (펼친 본문, 사용한 조각 id 집합).
+    refid 가 'namespace.X' 면 뒷부분으로도 찾고, 못 찾으면(외부 공용 조각) 지운다"""
+    used = set()
+    if depth > 5: return body, used
+    def sub(m):
+        rid = m.group(1); short = rid.rsplit('.', 1)[-1]
+        f = frag_body.get(rid, frag_body.get(short))
+        if f is None: return ''
+        used.add(short)
+        inner, u2 = expand_sql(f, depth + 1); used.update(u2); return inner
+    return INCLUDE_RE.sub(sub, body), used
+
+for sid, x, body in raw_stmts:
+    ebody, used = expand_sql(body)
+    id_to_tables[sid] = {m.upper() for m in TABLE_RE.findall(ebody)}
+    id_to_xml[sid] = x; id_frags[sid] = used
+done(f'statement {len(id_to_tables)}개 · sql 조각 {len(frag_body)}개 · 테이블 {len(set().union(set(), *id_to_tables.values()))}개')
 
 stage('Java → Mapper 호출 추적')
 sid_re = re.compile(r'["\.](' + '|'.join(sorted(map(re.escape, id_to_tables), key=len, reverse=True)) + r')\s*["(]') if id_to_tables else None
@@ -155,7 +207,8 @@ view_text, view_spans = {}, {}
 for i, f in enumerate(views, 1):
     tick(i, len(views), f.name); t = read(f); view_text[f] = t; lines[f] = t.count('\n')
     spans = fn_spans(t); view_spans[f] = spans
-    for fn, _, _ in spans: fn_defs[fn].add(f)
+    for key, params, _, _ in spans:
+        fn_defs[key].add(f); defs_by_name[key[0]].add(key); fn_sig.setdefault(key, f'{key[0]}({params})')
     lits = [(norm_url(m.group(1)), m.start(1)) for m in URL_LIT_RE.finditer(t)]
     for u, seg, match in url_pats:
         if seg not in t: continue
@@ -167,8 +220,13 @@ for i, f in enumerate(views, 1):
         for src in SCRIPT_SRC_RE.findall(t): js_included_by[src].add(f)
 for f, t in view_text.items():
     for m in FN_CALL_RE.finditer(t):
-        fn = m.group(1)
-        if fn in fn_defs and f not in fn_defs[fn]: fn_callers[fn].add((f, enclosing(view_spans[f], m.start())))
+        name = m.group(1)
+        if name not in defs_by_name: continue
+        n = count_args(t, m.end())
+        keys = [(name, n)] if (name, n) in fn_defs else defs_by_name[name]   # 인자 수가 맞는 정의가 있으면 그것만, 없으면 같은 이름 전부
+        here = enclosing(view_spans[f], m.start())
+        for key in keys:
+            if f not in fn_defs[key]: fn_callers[key].add((f, here))
 done(f'URL 호출 {sum(len(v) for v in view_calls_url.values())}건 · 함수 정의 {len(fn_defs)}개 · script include {sum(len(v) for v in js_included_by.values())}건')
 
 stage('영향 항목 수집')
@@ -183,17 +241,18 @@ def node(kind, key, impact, label=None, title=''):
     return nid
 def link(a, b, rel=''): edges.add((a, b, rel))
 def vnode(f, fn, impact):
-    return node(kind_of(f), f'{f.name}::{fn}' if fn else f.name, impact, f'{f.name} › {fn}()' if fn else f.name, str(f))
+    sig = fn_sig[fn] if fn else None
+    return node(kind_of(f), f'{f.name}::{sig}' if fn else f.name, impact, f'{f.name} › {sig}' if fn else f.name, str(f))
 def cnode(cj, m, url, impact):
     return node('Controller', f'{cj.stem}.{m} ({url})', impact, f'{cj.stem}.{m}', f'{url}\n{cj}')
 
 def hit_view(f, fn, impact, url, cn):
     """뷰(JSP/JS)가 컨트롤러 URL 을 부름 → 항목 추가 + 그 함수를 호출하는 곳까지 한 단계 더"""
-    add(kind_of(f), f, f.name, impact, f'{url} ← {fn}()' if fn else url)
+    add(kind_of(f), f, f.name, impact, f'{url} ← {fn_sig[fn]}' if fn else url)
     vn = vnode(f, fn, impact); link(vn, cn)
     if fn:
         for cf, cfn in fn_callers.get(fn, []):
-            add(kind_of(cf), cf, cf.name, '간접', f'{fn}() 호출'); link(vnode(cf, cfn, '간접'), vn)
+            add(kind_of(cf), cf, cf.name, '간접', f'{fn_sig[fn]} 호출'); link(vnode(cf, cfn, '간접'), vn)
 def hit_ctrl(cj, m, url, impact, via=''):
     add('Controller', cj, f'{cj.stem}.{m} ({url})', impact, via)
     cn = cnode(cj, m, url, impact)
@@ -219,11 +278,13 @@ def trace_down(cn, cj):
 
 # 테이블 / mapper id 기준: 아래에서 위로
 for sid, tables in id_to_tables.items():
-    hit_tbl = [t for t in tables if q in t.lower()]
-    if hit_tbl or q in sid.lower():
+    hit_tbl  = [t for t in tables if q in t.lower()]
+    hit_frag = [f for f in id_frags.get(sid, ()) if q in f.lower()]     # <sql> 조각 이름으로 검색한 경우
+    if hit_tbl or hit_frag or q in sid.lower():
         mn = node('Mapper', sid, '직접', title=str(id_to_xml[sid]))
         for t in hit_tbl: add('Table', '-', t, '직접'); link(mn, node('Table', t, '직접'))
-        add('Mapper', id_to_xml[sid], sid, '직접', ','.join(hit_tbl))
+        for f in hit_frag: add('Mapper', frag_xml[f], f, '직접', f'{sid} 가 include'); link(mn, node('Mapper', f, '직접', f'<sql> {f}', str(frag_xml[f])))
+        add('Mapper', id_to_xml[sid], sid, '직접', ','.join(hit_tbl + [f + ' 조각' for f in hit_frag]))
         by_cls = defaultdict(lambda: {'Service': [], 'DAO': [], 'stems': []})
         for j, ids in java_calls_id.items():
             if sid in ids:
@@ -243,31 +304,34 @@ done(f'테이블/Mapper 기준 {len(items)}건'); n = len(items)
 for url, (cj, m) in url_to_method.items():
     if q in url.lower() or q in m.lower(): trace_down(hit_ctrl(cj, m, url, '직접'), cj)
 done(f'URL 기준 +{len(items) - n}건'); n = len(items)
-# JS 함수 기준 (식별자 형태 검색어일 때만): 정의한 파일 직접, 호출한 파일 간접, 그 함수가 부르는 컨트롤러부터 아래로
-if re.fullmatch(r'\w+', a.query):
+# JS 함수 기준 (검색어가 '함수명' 또는 '함수명/인자수' 꼴일 때): 정의한 파일 직접, 호출한 파일 간접, 그 함수가 부르는 컨트롤러부터 아래로
+qm = re.fullmatch(r'(\w+)(?:/(\d+))?', a.query.strip())
+if qm:
+    qn, qa = qm.group(1).lower(), qm.group(2)
     for fn, files in fn_defs.items():
-        if q in fn.lower():
+        if qn in fn[0].lower() and (qa is None or fn[1] == int(qa)):
+            sig = fn_sig[fn]
             for v in files:
-                add(kind_of(v), v, f'{v.name}::{fn}', '직접', f'{fn} 정의'); vn = vnode(v, fn, '직접')
+                add(kind_of(v), v, f'{v.name}::{sig}', '직접', f'{sig} 정의'); vn = vnode(v, fn, '직접')
                 for url in fn_urls.get((v, fn), []):
                     cj, m = url_to_method[url]
-                    add('Controller', cj, f'{cj.stem}.{m} ({url})', '간접', f'{fn}()'); cn = cnode(cj, m, url, '간접')
+                    add('Controller', cj, f'{cj.stem}.{m} ({url})', '간접', sig); cn = cnode(cj, m, url, '간접')
                     link(vn, cn); trace_down(cn, cj)
                 for cf, cfn in fn_callers.get(fn, []):
-                    add(kind_of(cf), cf, cf.name, '간접', f'{fn}() 호출'); link(vnode(cf, cfn, '간접'), vn)
+                    add(kind_of(cf), cf, cf.name, '간접', f'{sig} 호출'); link(vnode(cf, cfn, '간접'), vn)
 done(f'JS 함수 기준 +{len(items) - n}건'); n = len(items)
 # 영향받은 JS 를 <script src> 로 물고 있는 JSP
 for jn in [x for x in nodes.values() if x['kind'] == 'JS']:
     for jsp in js_included_by.get(jn['id'].split('|', 1)[1].split('::')[0], []):
         add('JSP', jsp, jsp.name, '간접', f'{jn["label"].split(" ›")[0]} include'); link(vnode(jsp, None, '간접'), jn['id'], 'include')
 done(f'JS 를 include 하는 JSP +{len(items) - n}건')
-
-# 관계 정리: 같은 쌍에 호출/include 가 둘 다 있으면 호출만, 중간 노드를 거쳐 갈 수 있는 지름길 간선은 제거
+# 관계 정리: 같은 쌍에 호출/include 가 둘 다 있으면 호출만, 중간 노드를 거쳐 갈 수 있는 지름길 간선(C→DAO 가 있는데 C→Service→DAO 도 있음)은 제거
 pairs = {(x, y) for x, y, _ in edges}
 edges = {(x, y, r) for x, y, r in edges if not (r and (x, y, '') in edges)}
 out = defaultdict(set)
 for x, y in pairs: out[x].add(y)
 edges = {(x, y, r) for x, y, r in edges if r or not any(y in out[m] for m in out[x] if m != y)}
+
 
 stage('공수·일정 산정')
 

@@ -3,7 +3,7 @@
 # 의존성: openpyxl (엑셀 저장에만 사용). 나머지는 표준 라이브러리.
 import re, io, sys, json, time, pathlib, datetime as dt, webbrowser, threading
 from collections import defaultdict
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 
 PORT = 8765
@@ -39,7 +39,7 @@ MAP_RE = re.compile(r'@(?:Request|Get|Post|Put|Delete)Mapping\(\s*(?:(?:value|pa
                     r'(?:@\w+(?:\([^)]*\))?\s*)*(?:(?:public|protected|private|static|final|synchronized)\s+)*[\w<>\[\], ?]+\s+(\w+)\s*\(')
 CLASS_MAP_RE = re.compile(r'@RequestMapping\(\s*(?:(?:value|path)\s*=\s*)?\{?\s*"([^"]+)"')
 # JS 함수 정의: function a(  /  a = function(  /  a: function(  /  a = (…) =>
-FN_DEF_RE = re.compile(r'function\s+(\w+)\s*\(|\b(\w+)\s*=\s*(?:async\s+)?function\s*\(|\b(\w+)\s*:\s*(?:async\s+)?function\s*\(|\b(\w+)\s*=\s*(?:async\s*)?\([^()]*\)\s*=>')
+FN_DEF_RE = re.compile(r'function\s+(\w+)\s*\(|\b(\w+)\s*=\s*(?:async\s+)?function\s*\(|\b(\w+)\s*:\s*(?:async\s+)?function\s*\(|\b(\w+)\s*=\s*(?:async\s*)?\(([^()]*)\)\s*=>')
 FN_CALL_RE = re.compile(r'\b(\w+)\s*\(')
 FN_SKIP = {'function', 'if', 'for', 'while', 'switch', 'catch', 'return', 'typeof'}
 URL_LIT_RE = re.compile(r'["\']([^"\'\s<>]*/[^"\'\s<>]*)["\']')          # 슬래시가 든 문자열 리터럴 = URL 후보 ($.ajax url, form action, location.href, fetch 등 전부)
@@ -59,7 +59,8 @@ def url_matcher(url):
     return lambda lit: lit == url or lit.endswith(url)
 
 def fn_spans(t):
-    """JS/JSP 안의 함수 정의 → [(함수명, 시작, 끝)] (중괄호 짝으로 본문 범위 계산)"""
+    """JS/JSP 안의 함수 정의 → [((함수명, 인자수), 인자목록, 시작, 끝)] (중괄호 짝으로 본문 범위 계산).
+    같은 이름이라도 인자 수가 다르면 다른 함수로 취급 (fnRestoreApply(a, b) vs fnRestoreApply(a, b, c, d))"""
     stack, close = [], {}
     for i, ch in enumerate(t):
         if ch == '{': stack.append(i)
@@ -69,19 +70,41 @@ def fn_spans(t):
         fn = next(x for x in m.groups() if x)
         if len(fn) < 3 or fn in FN_SKIP: continue
         p = m.end()
-        if m.group(4) is None:                       # 화살표 함수가 아니면 파라미터 목록 건너뜀
-            p = t.find(')', p)
-            if p < 0: continue
-            p += 1
+        if m.group(4) is None:                       # 화살표 함수가 아니면 '(' 다음부터 ')' 까지가 파라미터
+            e = t.find(')', p)
+            if e < 0: continue
+            params, p = t[p:e], e + 1
+        else: params = m.group(5)
+        params = [x.split('=')[0].strip() for x in params.split(',') if x.strip()]
+        key, sig = (fn, len(params)), ', '.join(params)
         while p < len(t) and t[p] in ' \t\r\n': p += 1
-        if p < len(t) and t[p] == '{' and p in close: spans.append((fn, m.start(), close[p]))
-        else: spans.append((fn, m.start(), t.find('\n', p) if t.find('\n', p) > 0 else len(t)))   # 한 줄짜리 화살표 함수
+        if p < len(t) and t[p] == '{' and p in close: spans.append((key, sig, m.start(), close[p]))
+        else: spans.append((key, sig, m.start(), t.find('\n', p) if t.find('\n', p) > 0 else len(t)))   # 한 줄짜리 화살표 함수
     return spans
 
+def count_args(t, p):
+    """t[p] 가 '(' 바로 다음 위치일 때 호출 인자 개수 (괄호 깊이 0 의 콤마 수). 문자열 안의 콤마/괄호는 무시"""
+    depth, n, seen, q, i = 0, 0, False, None, p
+    while i < len(t) and i - p < 3000:
+        ch = t[i]
+        if q:
+            if ch == '\\': i += 1
+            elif ch == q: q = None
+        elif ch in '"\'`': q = ch; seen = True
+        elif ch in '([{': depth += 1; seen = True
+        elif ch in ')]}':
+            if depth == 0: return n + 1 if seen else 0
+            depth -= 1
+        elif ch == ',' and depth == 0: n += 1
+        elif not ch.isspace(): seen = True
+        i += 1
+    return n + 1 if seen else 0
+
 def enclosing(spans, pos):
+    """pos 를 감싸는 가장 안쪽 함수의 (함수명, 인자수). 함수 밖이면 None"""
     best = None
-    for fn, s, e in spans:
-        if s <= pos <= e and (best is None or e - s < best[2] - best[1]): best = (fn, s, e)
+    for key, _, s, e in spans:
+        if s <= pos <= e and (best is None or e - s < best[2] - best[1]): best = (key, s, e)
     return best[0] if best else None
 
 def kind_of(p):
@@ -111,9 +134,11 @@ def analyze(root, query, start, people, log=lambda s, replace=False: None):
     url_to_method, id_to_tables, id_to_xml, lines = {}, {}, {}, {}
     java_calls_id = defaultdict(set)      # java 파일 -> mapper ids
     view_calls_url = defaultdict(set)     # url -> {(파일, 함수명|None)}
-    fn_urls = defaultdict(set)            # (파일, 함수명) -> urls
-    fn_defs = defaultdict(set)            # 함수명 -> 정의한 파일
-    fn_callers = defaultdict(set)         # 함수명 -> {(호출 파일, 호출한 함수명|None)} (정의 파일 제외)
+    fn_urls = defaultdict(set)            # (파일, 함수키) -> urls          함수키 = (함수명, 인자수)
+    fn_defs = defaultdict(set)            # 함수키 -> 정의한 파일
+    fn_sig = {}                           # 함수키 -> 'fnName(a, b)' 표시용
+    defs_by_name = defaultdict(set)       # 함수명 -> 함수키들 (인자 수가 다른 정의들)
+    fn_callers = defaultdict(set)         # 함수키 -> {(호출 파일, 호출한 함수키|None)} (정의 파일 제외)
     js_included_by = defaultdict(set)     # js 파일명 -> <script src> 로 include 한 jsp
 
     stage('Controller URL 매핑')
@@ -126,12 +151,39 @@ def analyze(root, query, start, people, log=lambda s, replace=False: None):
     done(f'URL {len(url_to_method)}개')
 
     stage('Mapper XML 파싱')
+    # id 속성이 몇 번째에 오든(<select parameterType=".." id="..">) 잡히게 속성부를 통째로 캡처. <sql> 조각도 같이 수집
+    STMT_RE    = re.compile(r'<(select|insert|update|delete|sql)\s+([^>]*?)>(.*?)</\1>', re.S)
+    ID_ATTR_RE = re.compile(r'\bid="([^"]+)"')
+    INCLUDE_RE = re.compile(r'<include\s+refid="([^"]+)"\s*(?:/>|>.*?</include>)', re.S)
+    TABLE_RE   = re.compile(r'\b(?:FROM|JOIN|INTO|UPDATE)\s+([A-Za-z_][\w.]*)', re.I)
+
+    frag_body, frag_xml, id_frags, raw_stmts = {}, {}, {}, []   # <sql id="..."> 조각 / statement -> 그 안에서 쓴 조각들
     for i, x in enumerate(xmls, 1):
         tick(i, len(xmls), x.name); t = read(x)
-        for _, sid, body in re.findall(r'<(select|insert|update|delete)\s+id="([^"]+)"(.*?)</\1>', t, re.S):
-            id_to_tables[sid] = {m.upper() for m in re.findall(r'\b(?:FROM|JOIN|INTO|UPDATE)\s+([A-Za-z_][\w.]*)', body, re.I)}
-            id_to_xml[sid] = x
-    done(f'statement {len(id_to_tables)}개 · 테이블 {len(set().union(*id_to_tables.values()))}개')
+        for tag, attrs, body in STMT_RE.findall(t):
+            m = ID_ATTR_RE.search(attrs)
+            if not m: continue
+            if tag == 'sql': frag_body[m.group(1)] = body; frag_xml[m.group(1)] = x
+            else: raw_stmts.append((m.group(1), x, body))
+
+    def expand_sql(body, depth=0):
+        """<include refid="X"/> 를 <sql id="X"> 본문으로 치환 -> (펼친 본문, 사용한 조각 id 집합).
+        refid 가 'namespace.X' 면 뒷부분으로도 찾고, 못 찾으면(외부 공용 조각) 지운다"""
+        used = set()
+        if depth > 5: return body, used
+        def sub(m):
+            rid = m.group(1); short = rid.rsplit('.', 1)[-1]
+            f = frag_body.get(rid, frag_body.get(short))
+            if f is None: return ''
+            used.add(short)
+            inner, u2 = expand_sql(f, depth + 1); used.update(u2); return inner
+        return INCLUDE_RE.sub(sub, body), used
+
+    for sid, x, body in raw_stmts:
+        ebody, used = expand_sql(body)
+        id_to_tables[sid] = {m.upper() for m in TABLE_RE.findall(ebody)}
+        id_to_xml[sid] = x; id_frags[sid] = used
+    done(f'statement {len(id_to_tables)}개 · sql 조각 {len(frag_body)}개 · 테이블 {len(set().union(set(), *id_to_tables.values()))}개')
 
     stage('Java → Mapper 호출 추적')
     sid_re = re.compile(r'["\.](' + '|'.join(sorted(map(re.escape, id_to_tables), key=len, reverse=True)) + r')\s*["(]') if id_to_tables else None
@@ -149,7 +201,8 @@ def analyze(root, query, start, people, log=lambda s, replace=False: None):
     for i, f in enumerate(views, 1):
         tick(i, len(views), f.name); t = read(f); view_text[f] = t; lines[f] = t.count('\n')
         spans = fn_spans(t); view_spans[f] = spans
-        for fn, _, _ in spans: fn_defs[fn].add(f)
+        for key, params, _, _ in spans:
+            fn_defs[key].add(f); defs_by_name[key[0]].add(key); fn_sig.setdefault(key, f'{key[0]}({params})')
         lits = [(norm_url(m.group(1)), m.start(1)) for m in URL_LIT_RE.finditer(t)]
         for u, seg, match in url_pats:
             if seg not in t: continue
@@ -161,8 +214,13 @@ def analyze(root, query, start, people, log=lambda s, replace=False: None):
             for src in SCRIPT_SRC_RE.findall(t): js_included_by[src].add(f)
     for f, t in view_text.items():
         for m in FN_CALL_RE.finditer(t):
-            fn = m.group(1)
-            if fn in fn_defs and f not in fn_defs[fn]: fn_callers[fn].add((f, enclosing(view_spans[f], m.start())))
+            name = m.group(1)
+            if name not in defs_by_name: continue
+            n = count_args(t, m.end())
+            keys = [(name, n)] if (name, n) in fn_defs else defs_by_name[name]   # 인자 수가 맞는 정의가 있으면 그것만, 없으면 같은 이름 전부
+            here = enclosing(view_spans[f], m.start())
+            for key in keys:
+                if f not in fn_defs[key]: fn_callers[key].add((f, here))
     done(f'URL 호출 {sum(len(v) for v in view_calls_url.values())}건 · 함수 정의 {len(fn_defs)}개 · script include {sum(len(v) for v in js_included_by.values())}건')
 
     stage('영향 항목 수집')
@@ -177,17 +235,18 @@ def analyze(root, query, start, people, log=lambda s, replace=False: None):
         return nid
     def link(a, b, rel=''): edges.add((a, b, rel))
     def vnode(f, fn, impact):
-        return node(kind_of(f), f'{f.name}::{fn}' if fn else f.name, impact, f'{f.name} › {fn}()' if fn else f.name, str(f))
+        sig = fn_sig[fn] if fn else None
+        return node(kind_of(f), f'{f.name}::{sig}' if fn else f.name, impact, f'{f.name} › {sig}' if fn else f.name, str(f))
     def cnode(cj, m, url, impact):
         return node('Controller', f'{cj.stem}.{m} ({url})', impact, f'{cj.stem}.{m}', f'{url}\n{cj}')
 
     def hit_view(f, fn, impact, url, cn):
         """뷰(JSP/JS)가 컨트롤러 URL 을 부름 → 항목 추가 + 그 함수를 호출하는 곳까지 한 단계 더"""
-        add(kind_of(f), f, f.name, impact, f'{url} ← {fn}()' if fn else url)
+        add(kind_of(f), f, f.name, impact, f'{url} ← {fn_sig[fn]}' if fn else url)
         vn = vnode(f, fn, impact); link(vn, cn)
         if fn:
             for cf, cfn in fn_callers.get(fn, []):
-                add(kind_of(cf), cf, cf.name, '간접', f'{fn}() 호출'); link(vnode(cf, cfn, '간접'), vn)
+                add(kind_of(cf), cf, cf.name, '간접', f'{fn_sig[fn]} 호출'); link(vnode(cf, cfn, '간접'), vn)
     def hit_ctrl(cj, m, url, impact, via=''):
         add('Controller', cj, f'{cj.stem}.{m} ({url})', impact, via)
         cn = cnode(cj, m, url, impact)
@@ -213,11 +272,13 @@ def analyze(root, query, start, people, log=lambda s, replace=False: None):
 
     # 테이블 / mapper id 기준: 아래에서 위로
     for sid, tables in id_to_tables.items():
-        hit_tbl = [t for t in tables if q in t.lower()]
-        if hit_tbl or q in sid.lower():
+        hit_tbl  = [t for t in tables if q in t.lower()]
+        hit_frag = [f for f in id_frags.get(sid, ()) if q in f.lower()]     # <sql> 조각 이름으로 검색한 경우
+        if hit_tbl or hit_frag or q in sid.lower():
             mn = node('Mapper', sid, '직접', title=str(id_to_xml[sid]))
             for t in hit_tbl: add('Table', '-', t, '직접'); link(mn, node('Table', t, '직접'))
-            add('Mapper', id_to_xml[sid], sid, '직접', ','.join(hit_tbl))
+            for f in hit_frag: add('Mapper', frag_xml[f], f, '직접', f'{sid} 가 include'); link(mn, node('Mapper', f, '직접', f'<sql> {f}', str(frag_xml[f])))
+            add('Mapper', id_to_xml[sid], sid, '직접', ','.join(hit_tbl + [f + ' 조각' for f in hit_frag]))
             by_cls = defaultdict(lambda: {'Service': [], 'DAO': [], 'stems': []})
             for j, ids in java_calls_id.items():
                 if sid in ids:
@@ -237,18 +298,21 @@ def analyze(root, query, start, people, log=lambda s, replace=False: None):
     for url, (cj, m) in url_to_method.items():
         if q in url.lower() or q in m.lower(): trace_down(hit_ctrl(cj, m, url, '직접'), cj)
     done(f'URL 기준 +{len(items) - n}건'); n = len(items)
-    # JS 함수 기준 (식별자 형태 검색어일 때만): 정의한 파일 직접, 호출한 파일 간접, 그 함수가 부르는 컨트롤러부터 아래로
-    if re.fullmatch(r'\w+', query):
+    # JS 함수 기준 (검색어가 '함수명' 또는 '함수명/인자수' 꼴일 때): 정의한 파일 직접, 호출한 파일 간접, 그 함수가 부르는 컨트롤러부터 아래로
+    qm = re.fullmatch(r'(\w+)(?:/(\d+))?', query.strip())
+    if qm:
+        qn, qa = qm.group(1).lower(), qm.group(2)
         for fn, files in fn_defs.items():
-            if q in fn.lower():
+            if qn in fn[0].lower() and (qa is None or fn[1] == int(qa)):
+                sig = fn_sig[fn]
                 for v in files:
-                    add(kind_of(v), v, f'{v.name}::{fn}', '직접', f'{fn} 정의'); vn = vnode(v, fn, '직접')
+                    add(kind_of(v), v, f'{v.name}::{sig}', '직접', f'{sig} 정의'); vn = vnode(v, fn, '직접')
                     for url in fn_urls.get((v, fn), []):
                         cj, m = url_to_method[url]
-                        add('Controller', cj, f'{cj.stem}.{m} ({url})', '간접', f'{fn}()'); cn = cnode(cj, m, url, '간접')
+                        add('Controller', cj, f'{cj.stem}.{m} ({url})', '간접', sig); cn = cnode(cj, m, url, '간접')
                         link(vn, cn); trace_down(cn, cj)
                     for cf, cfn in fn_callers.get(fn, []):
-                        add(kind_of(cf), cf, cf.name, '간접', f'{fn}() 호출'); link(vnode(cf, cfn, '간접'), vn)
+                        add(kind_of(cf), cf, cf.name, '간접', f'{sig} 호출'); link(vnode(cf, cfn, '간접'), vn)
     done(f'JS 함수 기준 +{len(items) - n}건'); n = len(items)
     # 영향받은 JS 를 <script src> 로 물고 있는 JSP
     for jn in [x for x in nodes.values() if x['kind'] == 'JS']:
@@ -327,7 +391,7 @@ def write_xlsx(res):
            ['테스트', f'x{TEST_RATIO}', '개발공수 대비'], ['버퍼', f'x{BUFFER_RATIO}', '개발+테스트 대비']], [16, 16, 30])
     buf = io.BytesIO(); wb.save(buf); return buf.getvalue()
 
-HTML = r'''<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>영향도 분석</title>
+HTML = r'''<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>영향도 분석</title><link rel="icon" href="/favicon.ico">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
 :root{--bg:#eef1f5;--panel:#fff;--ink:#1c2430;--muted:#66717f;--line:#d5dbe3;--acc:#1f4e8c;--acc2:#e8f0fb;--direct:#b23a2a;--indirect:#8a6d1f}
@@ -336,7 +400,7 @@ header{background:var(--acc);color:#fff;padding:14px 24px;display:flex;align-ite
 header h1{margin:0;font-size:18px;font-weight:600}header span{opacity:.75;font-size:13px}
 main{display:grid;grid-template-columns:300px 1fr;gap:16px;padding:16px 24px;min-height:calc(100vh - 52px)}
 @media(max-width:820px){main{grid-template-columns:1fr}}
-.panel{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:16px}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:16px;min-width:0}
 label{display:block;font-size:12px;color:var(--muted);margin:10px 0 4px}label:first-child{margin-top:0}
 input{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:4px;font:inherit}input:focus{outline:2px solid var(--acc);outline-offset:1px;border-color:var(--acc)}
 .row{display:flex;gap:6px}.row input{flex:1}
@@ -371,6 +435,7 @@ td input{padding:4px 6px;font-size:12px;min-width:90px}
 .gw .n.direct rect{stroke:var(--direct);fill:#fdf3f1}.gw .n.indirect rect{stroke:#d9b45a;fill:#fdf8ea}
 .gw .e{fill:none;stroke:#9aa7b8;stroke-width:1.4;marker-end:url(#ar)}.gw .e.include{stroke-dasharray:4 3}
 .gw.focus .n:not(.hl){opacity:.18}.gw.focus .e:not(.hl){opacity:.08}.gw .e.hl{stroke:var(--acc);stroke-width:2.2;marker-end:url(#arh)}.gw .n.hl rect{stroke-width:2;filter:drop-shadow(0 1px 2px rgba(0,0,0,.15))}.gw .n.hl.pin rect{stroke:var(--acc)}
+.gtools{display:flex;gap:6px;align-items:center;margin-bottom:8px}.gtools button{padding:4px 10px;font-size:12px}.gtools span{font-size:12px;color:var(--muted);min-width:40px;text-align:center}
 .ghint{font-size:12px;color:var(--muted);margin:8px 0 0;display:flex;gap:14px;flex-wrap:wrap}.ghint i{display:inline-block;width:10px;height:10px;border-radius:2px;vertical-align:-1px;margin-right:4px;border:1.5px solid}
 </style></head><body>
 <header><h1>영향도 분석</h1><span>Spring MVC · JSP/JS → Controller → Service → Mapper → 테이블</span></header>
@@ -378,14 +443,14 @@ td input{padding:4px 6px;font-size:12px;min-width:90px}
 <section class="panel">
  <label for="root">소스 루트 폴더</label>
  <div class="row"><input id="root" list="roots" placeholder="D:\workspace\dWorks\src"><button class="ghost" id="pick" title="폴더 선택">…</button></div>
- <label for="q">검색어</label><input id="q" list="queries" placeholder="TB_USER / selectUserList / /user/list / fn_search">
+ <label for="q">검색어</label><input id="q" list="queries" placeholder="TB_USER / selectUserList / /user/list / fn_search / fn_search/2">
  <label for="start">작업 시작일</label><input id="start" type="date">
  <label for="people">투입 인원</label><input id="people" type="number" step="0.5" min="0.5" value="1">
  <div class="actions"><button id="run">분석 실행</button><button class="ghost" id="export" disabled>엑셀로 저장</button></div>
  <div class="msg" id="msg"></div>
  <datalist id="roots"></datalist><datalist id="queries"></datalist>
  <div class="hist"><h2>최근 분석</h2><ul id="hist"></ul></div>
- <div class="hint">검색어는 테이블명, mapper id, 컨트롤러 URL 일부, JS 함수명(fn_xxx) 모두 가능합니다. 대소문자 구분 없이 부분 일치로 찾습니다.<br><br>표에서 담당자·조치내용·비고를 입력하면 엑셀에 같이 저장됩니다.</div>
+ <div class="hint">검색어는 테이블명, mapper id, 컨트롤러 URL 일부, JS 함수명 모두 가능합니다. 대소문자 구분 없이 부분 일치로 찾습니다. 같은 이름의 JS 함수가 인자 수만 다르게 여러 개면 <b>함수명/인자수</b> (예: fnRestoreApply/4) 로 골라서 볼 수 있습니다.<br><br>표에서 담당자·조치내용·비고를 입력하면 엑셀에 같이 저장됩니다.</div>
 </section>
 <section class="panel">
  <div id="prog" class="prog" hidden><div class="ph"><b id="ptitle"></b><span id="ptime"></span></div><pre id="plog"></pre></div>
@@ -399,7 +464,7 @@ td input{padding:4px 6px;font-size:12px;min-width:90px}
  </div>
  <div class="tw"><table><thead><tr><th>No</th><th>구분</th><th>항목</th><th>파일</th><th>영향</th><th>경유</th><th>MD</th><th>시작</th><th>종료</th><th>담당자</th><th>조치내용</th><th>비고</th></tr></thead>
  <tbody id="tb"><tr><td colspan="12" class="empty">소스 루트와 검색어를 입력하고 분석을 실행하세요.</td></tr></tbody></table></div>
- <div id="gwrap" hidden><div class="gw" id="gw"></div>
+ <div id="gwrap" hidden><div class="gtools"><button class="ghost" onclick="gfit()">폭 맞춤</button><button class="ghost" onclick="gzoom(1/1.25)">−</button><span id="gz">100%</span><button class="ghost" onclick="gzoom(1.25)">+</button><button class="ghost" onclick="gzoom(1/gz)">100%</button></div><div class="gw" id="gw"></div>
   <div class="ghint"><span><i style="border-color:var(--direct);background:#fdf3f1"></i>직접</span><span><i style="border-color:#d9b45a;background:#fdf8ea"></i>간접</span><span>실선: 호출 · 점선: script include</span><span>노드에 마우스를 올리면 연결된 경로만 강조, 클릭하면 고정</span></div></div>
 </section>
 </main>
@@ -412,17 +477,18 @@ function stats(){const s=res.summary;$('#stats').innerHTML=[
  ['영향 항목',s.count+'건',`직접 ${s.direct} · 간접 ${s.indirect}`],['개발 공수',s.dev+' MD',''],['테스트 · 버퍼',(s.test+s.buffer).toFixed(2)+' MD',`${s.test} + ${s.buffer}`],
  ['총 공수',s.total+' MD',`${s.people}명 투입`,'total'],['예상 기간',s.days+' 영업일',`${s.start} ~ ${s.end}`]
 ].map(([l,v,sub,c])=>`<div class="stat ${c||''}"><span>${l}</span><b>${v}</b><span>${sub}</span></div>`).join('');}
-const COLS=['JSP','JS','Controller','Service','DAO','Mapper','Table'];
+const COLS=['JSP','JS','Controller','Service','DAO','Mapper','Table'];let gz=1,gfitOn=true,gfit=()=>{},gzoom=()=>{};window.addEventListener('resize',()=>{if(gfitOn&&!$('#gwrap').hidden)gfit();});
 function graph(){const g=res.graph,gw=$('#gw');gw.className='gw';
  if(!g.nodes.length){gw.innerHTML='<div class="empty">표시할 관계가 없습니다.</div>';return;}
  const N={};g.nodes.forEach(n=>{N[n.id]=n;n.c=Math.max(0,COLS.indexOf(n.kind));n.out=[];n.in=[];});
  const E=g.edges.filter(([a,b])=>N[a]&&N[b]);E.forEach(([a,b])=>{N[a].out.push(b);N[b].in.push(a);});
- const cols=COLS.map(()=>[]);g.nodes.forEach(n=>cols[n.c].push(n));
+ const used=COLS.map((k,i)=>i).filter(i=>g.nodes.some(n=>n.c===i));g.nodes.forEach(n=>{n.c=used.indexOf(n.c);});   // 비어 있는 열은 빼고 붙여서 그림
+ const cols=used.map(()=>[]);g.nodes.forEach(n=>cols[n.c].push(n));
  const idx={};const reidx=()=>cols.forEach(c=>c.forEach((n,i)=>idx[n.id]=i));reidx();
  for(let p=0;p<4;p++){const dir=p%2?[...cols].reverse():cols;dir.forEach(c=>{c.forEach(n=>{const nb=[...n.in,...n.out].map(x=>idx[x]);n.k=nb.length?nb.reduce((a,b)=>a+b,0)/nb.length:idx[n.id];});c.sort((a,b)=>a.k-b.k||a.label.localeCompare(b.label));reidx();});}
- const CW=270,NW=190,NH=30,GAP=12,TOP=40,LEFT=16,rows=Math.max(...cols.map(c=>c.length)),H=TOP+rows*(NH+GAP)+16,W=LEFT*2+COLS.length*CW-(CW-NW);
+ const CW=270,NW=190,NH=30,GAP=12,TOP=40,LEFT=64,rows=Math.max(...cols.map(c=>c.length)),H=TOP+rows*(NH+GAP)+16,W=LEFT+cols.length*CW-(CW-NW)+24;
  cols.forEach((c,ci)=>{const off=(rows-c.length)*(NH+GAP)/2;c.forEach((n,i)=>{n.x=LEFT+ci*CW;n.y=TOP+off+i*(NH+GAP);});});
- const cut=(t,n)=>t.length>n?t.slice(0,n-1)+'…':t;
+ const cut=(t,n)=>t.length>n?t.slice(0,n-9)+'…'+t.slice(-8):t;   // 앞뒤를 남기고 가운데를 줄임 (인자 목록이 보이게)
  // 한 노드에 선이 여러 개 붙으면 접점을 세로로 조금씩 벌려서 겹치지 않게
  const port=(n,list,key)=>{const arr=list.slice().sort((p,q)=>N[p[key]].y-N[q[key]].y),step=Math.min(7,18/Math.max(1,arr.length-1));const m={};arr.forEach((e,i)=>m[e[3]]=n.y+NH/2+(i-(arr.length-1)/2)*step);return m;};
  E.forEach((e,i)=>e[3]=i);const outP={},inP={};
@@ -430,14 +496,16 @@ function graph(){const g=res.graph,gw=$('#gw');gw.className='gw';
  let svg=`<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}"><defs>
   <marker id="ar" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0.5 L7 4 L0 7.5 z" fill="#9aa7b8"/></marker>
   <marker id="arh" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0.5 L7 4 L0 7.5 z" fill="#1f4e8c"/></marker></defs>`;
- COLS.forEach((k,ci)=>{svg+=`<text class="col" x="${LEFT+ci*CW}" y="22">${k}${cols[ci].length?` (${cols[ci].length})`:''}</text>`;if(ci)svg+=`<line class="colline" x1="${LEFT+ci*CW-(CW-NW)/2}" y1="30" x2="${LEFT+ci*CW-(CW-NW)/2}" y2="${H-8}"/>`;});
+ used.forEach((k0,ci)=>{const k=COLS[k0];svg+=`<text class="col" x="${LEFT+ci*CW}" y="22">${k} (${cols[ci].length})</text>`;if(ci)svg+=`<line class="colline" x1="${LEFT+ci*CW-(CW-NW)/2}" y1="30" x2="${LEFT+ci*CW-(CW-NW)/2}" y2="${H-8}"/>`;});
  E.forEach(e=>{const [a,b,r,i]=e,A=N[a],B=N[b],y1=outP[a][i],y2=inP[b][i];let d;
   if(B.c>A.c){const x1=A.x+NW,x2=B.x,k=Math.max(40,(x2-x1)*0.5);d=`M${x1} ${y1} C${x1+k} ${y1}, ${x2-k} ${y2}, ${x2} ${y2}`;}          // 오른쪽으로: 오른쪽 변 → 왼쪽 변
   else if(B.c<A.c){const x1=A.x,x2=B.x+NW,k=Math.max(40,(x1-x2)*0.5);d=`M${x1} ${y1} C${x1-k} ${y1}, ${x2+k} ${y2}, ${x2} ${y2}`;}     // 왼쪽으로(역방향): 왼쪽 변 → 오른쪽 변
   else{const x=A.x,k=Math.min(50,(CW-NW)*0.7);d=`M${x} ${y1} C${x-k} ${y1}, ${x-k} ${y2}, ${x} ${y2}`;}                                 // 같은 열(JS→JS 호출): 왼쪽으로 볼록한 곡선
   svg+=`<path class="e ${r}" data-a="${esc(a)}" data-b="${esc(b)}" d="${d}"/>`;});
  g.nodes.forEach(n=>{svg+=`<g class="n ${n.impact==='직접'?'direct':'indirect'}" data-id="${esc(n.id)}" transform="translate(${n.x},${n.y})"><title>${esc(n.label)}${n.title?'\n'+esc(n.title):''}</title><rect width="${NW}" height="${NH}"/><text x="9" y="19">${esc(cut(n.label,27))}</text></g>`;});
- gw.innerHTML=svg+'</svg>';
+ gw.innerHTML=svg+'</svg>';const sv=gw.querySelector('svg');
+ const zoom=z=>{gz=z;sv.setAttribute('width',Math.round(W*z));sv.setAttribute('height',Math.round(H*z));$('#gz').textContent=Math.round(z*100)+'%';};
+ gfit=()=>{gfitOn=true;zoom(Math.min(1,(gw.clientWidth-4)/W));};gzoom=d=>{gfitOn=false;zoom(Math.max(.3,Math.min(2,gz*d)));};gfit();
  const reach=(id,dir)=>{const seen=new Set([id]),st=[id];while(st.length){const x=st.pop();N[x][dir].forEach(y=>{if(!seen.has(y)){seen.add(y);st.push(y);}});}return seen;};
  let pin=null;
  const focus=id=>{gw.classList.toggle('focus',!!id);gw.querySelectorAll('.hl').forEach(e=>e.classList.remove('hl','pin'));if(!id)return;
@@ -530,6 +598,7 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
     def _send(self, code, body, ctype='application/json; charset=utf-8', extra=None):
         self.send_response(code); self.send_header('Content-Type', ctype)
+        self.send_header('Content-Length', str(len(body)))   # 없으면 브라우저가 응답 끝을 못 알아채고 기다림
         for k, v in (extra or {}).items(): self.send_header(k, v)
         self.end_headers(); self.wfile.write(body)
     def _json(self):
@@ -537,6 +606,10 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         p = urlparse(self.path).path
         if p == '/': return self._send(200, HTML.encode('utf-8'), 'text/html; charset=utf-8')
+        if p == '/favicon.ico':
+            ico = pathlib.Path(__file__).with_name('impact.ico')
+            if ico.exists(): return self._send(200, ico.read_bytes(), 'image/x-icon', {'Cache-Control': 'max-age=86400'})
+            return self._send(404, b'')
         if p == '/history': return self._send(200, json.dumps(load_hist(), ensure_ascii=False).encode('utf-8'))
         if p == '/progress': return self._send(200, json.dumps(job_state(), ensure_ascii=False).encode('utf-8'))
         if p == '/pick':
@@ -569,9 +642,19 @@ class H(BaseHTTPRequestHandler):
             self._send(400, json.dumps({'error': str(e)}, ensure_ascii=False).encode('utf-8'))
 
 if __name__ == '__main__':
-    srv = HTTPServer(('127.0.0.1', PORT), H)
+    # ThreadingHTTPServer: 단일 스레드면 브라우저가 연결 하나를 물고 있을 때 나머지 요청이 전부 막힘
+    # (진행상황 폴링 때문에 연결이 여러 개 열림)
     url = f'http://127.0.0.1:{PORT}'
-    print(f'영향도 분석 UI: {url}  (종료: Ctrl+C)')
+    try:
+        srv = ThreadingHTTPServer(('127.0.0.1', PORT), H)
+    except OSError as e:
+        print(f'\n[중단] {PORT} 포트를 열 수 없습니다 ({e})')
+        print(f'       이전에 띄운 창이 아직 떠 있을 수 있습니다. 브라우저에서 {url} 을 먼저 열어 보세요.')
+        print(f'       그래도 안 되면 남아 있는 프로세스를 정리하세요:')
+        print(f'         powershell "Get-NetTCPConnection -LocalPort {PORT} | %{{ Stop-Process -Id $_.OwningProcess -Force }}"')
+        input('\nEnter 를 누르면 닫힙니다...'); raise SystemExit(1)
+    srv.daemon_threads = True
+    print(f'영향도 분석 UI: {url}  (종료: Ctrl+C 또는 이 창 닫기)')
     threading.Timer(0.5, lambda: webbrowser.open(url)).start()
     try: srv.serve_forever()
-    except KeyboardInterrupt: pass
+    except KeyboardInterrupt: print('\n종료합니다.')
